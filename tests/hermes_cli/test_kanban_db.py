@@ -1896,6 +1896,120 @@ def test_archive_running_task_terminates_worker(kanban_home, monkeypatch):
         assert kb.get_task(conn, t).status == "archived"
 
 
+# ---------------------------------------------------------------------------
+# heartbeat_claim lease extension across a dispatcher-pinned claim_lock
+# (t_05c82a67: heartbeat_claim never extends the claim -- PID mismatch)
+# ---------------------------------------------------------------------------
+
+
+def test_heartbeat_claim_extends_lease_when_lock_differs_from_live_claimer_id(kanban_home):
+    """The dispatcher pins ``HERMES_KANBAN_CLAIM_LOCK`` to the lock recorded at
+    ``claim_task`` time and every heartbeat call (CLI + tool) passes that pinned
+    value back in as ``claimer``. If a heartbeat instead recomputed
+    ``_claimer_id()`` live (host:pid of the CURRENT process), it would almost
+    always mismatch the stored ``claim_lock`` -- the exact PID-mismatch bug in
+    t_05c82a67 -- and the ``UPDATE ... WHERE claim_lock = ?`` would affect 0
+    rows, silently failing to extend the lease.
+
+    This simulates the dispatcher-set env lock (``dispatcher_lock``) diverging
+    from what a bare, live recompute of ``_claimer_id()`` would produce, and
+    asserts heartbeating with the pinned lock genuinely moves claim_expires
+    forward on both the task row and its active run row.
+    """
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="long build", assignee="a")
+        dispatcher_lock = "some-other-host:999999"
+        kb.claim_task(conn, t, claimer=dispatcher_lock)
+        task = kb.get_task(conn, t)
+        assert task.claim_lock == dispatcher_lock
+        original_expires = task.claim_expires
+
+        # The failure mode: a live recompute would NOT match the stored lock.
+        assert kb._claimer_id() != dispatcher_lock
+        # Heartbeating with the recomputed (wrong) claimer is the bug reproduced
+        # directly: it must fail to extend (0 rows updated).
+        assert kb.heartbeat_claim(conn, t, claimer=kb._claimer_id()) is False
+        assert kb.get_task(conn, t).claim_expires == original_expires
+
+        # Heartbeating with the pinned dispatcher lock (the fix / correct usage)
+        # must succeed and move claim_expires forward.
+        time.sleep(1.01)
+        assert kb.heartbeat_claim(conn, t, claimer=dispatcher_lock) is True
+        task2 = kb.get_task(conn, t)
+        assert task2.claim_expires > original_expires
+
+        run_row = conn.execute(
+            "SELECT claim_expires FROM task_runs WHERE task_id = ? "
+            "ORDER BY id DESC LIMIT 1", (t,),
+        ).fetchone()
+        assert run_row["claim_expires"] == task2.claim_expires
+
+
+def test_heartbeating_worker_survives_well_past_default_claim_ttl(kanban_home, monkeypatch):
+    """A worker that heartbeats regularly with its pinned claim lock must never
+    be reclaimed by ``release_stale_claims``, even long after the original
+    ``DEFAULT_CLAIM_TTL_SECONDS`` (15 min) window has elapsed -- simulating the
+    trading-agent suite's ~53-58 minute real build time. Uses a claim_lock that
+    does NOT match this host's prefix so the host-local live-PID safety net in
+    ``release_stale_claims`` cannot mask a heartbeat-extension bug: the lease
+    must survive on the heartbeat mechanism alone.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    fake_now = [int(time.time())]
+    monkeypatch.setattr(_kb.time, "time", lambda: fake_now[0])
+
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="trading-agent suite", assignee="a")
+        remote_lock = "remote-worker-host:424242"
+        kb.claim_task(conn, t, claimer=remote_lock)
+        assert kb.get_task(conn, t).claim_lock == remote_lock
+
+        ttl = kb.DEFAULT_CLAIM_TTL_SECONDS
+        assert ttl == 15 * 60
+
+        # Heartbeat every 5 minutes for 58 minutes (trading-agent suite runtime),
+        # well past the 15-minute TTL -- each heartbeat must keep extending the
+        # lease so a mid-flight release_stale_claims sweep never reclaims it.
+        for _ in range(12):
+            fake_now[0] += 5 * 60
+            assert kb.heartbeat_claim(conn, t, claimer=remote_lock) is True
+            reclaimed = kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None)
+            assert reclaimed == 0
+            assert kb.get_task(conn, t).status == "running"
+            assert kb.get_task(conn, t).claim_lock == remote_lock
+
+        # Sanity: elapsed wall time exceeds the default TTL several times over.
+        assert fake_now[0] - int(time.time()) >= 0
+        assert kb.get_task(conn, t).status == "running"
+
+
+def test_heartbeat_gap_past_ttl_without_extension_is_reclaimed(kanban_home, monkeypatch):
+    """Control case for the two tests above: a claim that is NEVER heartbeated
+    (or whose heartbeat's claimer never matches the stored lock) genuinely
+    expires and IS reclaimed once its TTL elapses -- proving
+    ``release_stale_claims`` still does its job and the fix does not
+    accidentally make every claim immortal.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    fake_now = [int(time.time())]
+    monkeypatch.setattr(_kb.time, "time", lambda: fake_now[0])
+
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="abandoned", assignee="a")
+        remote_lock = "remote-worker-host:1111"
+        kb.claim_task(conn, t, claimer=remote_lock)
+
+        # No heartbeat at all; the claim_lock is not host-local, so the live-PID
+        # safety net does not apply either.
+        fake_now[0] += kb.DEFAULT_CLAIM_TTL_SECONDS + 1
+        reclaimed = kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None)
+        assert reclaimed == 1
+        assert kb.get_task(conn, t).status in ("ready", "todo")
+        assert kb.get_task(conn, t).claim_lock is None
+
+
 def test_archive_non_running_task_does_not_attempt_termination(kanban_home):
     """A never-claimed (``triage``/``ready``/``done``) task has no live worker:
     ``archive_task`` must not signal anything, and no termination event is

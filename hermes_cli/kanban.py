@@ -316,7 +316,19 @@ def _cmd_init(args: argparse.Namespace) -> int:
 
 
 def _cmd_heartbeat(args: argparse.Namespace) -> int:
+    """CLI twin of the ``kanban_heartbeat`` tool: extend the claim lease AND
+    record the liveness event. Extending only ``last_heartbeat_at`` (as this
+    used to do) never moved ``claim_expires`` forward, so a worker that drives
+    the board through this CLI path instead of the tool call -- e.g. the
+    ``hermes kanban heartbeat $TASK`` shell invocation documented for
+    long-running operations -- kept heartbeating while ``release_stale_claims``
+    silently reclaimed it once the TTL (default 15 min) elapsed (t_05c82a67).
+    The dispatcher pins ``HERMES_KANBAN_CLAIM_LOCK`` at spawn; the default
+    claimer (``None`` -> ``kb._claimer_id()``) covers locally-driven workers
+    that bypassed the dispatcher, exactly like the tool handler.
+    """
     with kbc.connect_closing() as conn:
+        kb.heartbeat_claim(conn, args.task_id, claimer=os.environ.get("HERMES_KANBAN_CLAIM_LOCK"))
         ok = kbd.heartbeat_worker(conn, args.task_id, note=getattr(args, "note", None),
                                  expected_run_id=_worker_run_id_for(args.task_id))
     return _ok_or_err(ok, f"cannot heartbeat {args.task_id} (not running?)",
