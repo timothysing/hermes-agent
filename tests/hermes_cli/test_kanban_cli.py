@@ -173,6 +173,44 @@ def test_run_slash_reclaim_running_task(kanban_home):
 
 
 # ---------------------------------------------------------------------------
+# /kanban claim — worker_pid dispatch-recording gap (t_05c82a67, fix direction b)
+# ---------------------------------------------------------------------------
+
+
+def test_cli_claim_records_worker_pid_for_this_process(kanban_home):
+    """``hermes kanban claim`` (this process being the worker) must durably record
+    ``worker_pid`` on both the task and its run row -- NOT just ``claim_lock``.
+
+    Before this fix, ``_cmd_claim`` called ``kb.claim_task`` and stopped: the claim
+    lock was set to ``host:os.getpid()`` by the default claimer, but nothing wrote
+    that pid onto ``tasks.worker_pid``. A task claimed this way therefore always
+    carried ``worker_pid=None``/``host_local=False`` in every later reclaim event,
+    which is exactly the live evidence from t_05c82a67 (trading-agent run #181):
+    ``release_stale_claims``'s host-local live-worker safety net cannot recognise
+    -- let alone protect -- a claim with no recorded pid, so a long CLI-driven
+    build gets silently reclaimed mid-flight even while it is heartbeating fine.
+    """
+    import os as _os
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="cli-claimed build", assignee="alice")
+
+    out = kc.run_slash(f"claim {tid}")
+    assert "Claimed" in out, out
+
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, tid)
+        assert task.status == "running"
+        assert task.worker_pid == _os.getpid()
+        started_at = conn.execute(
+            "SELECT worker_started_at FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()[0]
+        assert started_at is not None
+        run = kb.latest_run(conn, tid)
+        assert run is not None and run.worker_pid == _os.getpid()
+
+
+# ---------------------------------------------------------------------------
 # /kanban specify — slash surface (same entry point CLI + gateway use)
 # ---------------------------------------------------------------------------
 

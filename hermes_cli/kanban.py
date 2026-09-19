@@ -316,7 +316,19 @@ def _cmd_init(args: argparse.Namespace) -> int:
 
 
 def _cmd_heartbeat(args: argparse.Namespace) -> int:
+    """CLI twin of the ``kanban_heartbeat`` tool: extend the claim lease AND
+    record the liveness event. Extending only ``last_heartbeat_at`` (as this
+    used to do) never moved ``claim_expires`` forward, so a worker that drives
+    the board through this CLI path instead of the tool call -- e.g. the
+    ``hermes kanban heartbeat $TASK`` shell invocation documented for
+    long-running operations -- kept heartbeating while ``release_stale_claims``
+    silently reclaimed it once the TTL (default 15 min) elapsed (t_05c82a67).
+    The dispatcher pins ``HERMES_KANBAN_CLAIM_LOCK`` at spawn; the default
+    claimer (``None`` -> ``kb._claimer_id()``) covers locally-driven workers
+    that bypassed the dispatcher, exactly like the tool handler.
+    """
     with kbc.connect_closing() as conn:
+        kb.heartbeat_claim(conn, args.task_id, claimer=os.environ.get("HERMES_KANBAN_CLAIM_LOCK"))
         ok = kbd.heartbeat_worker(conn, args.task_id, note=getattr(args, "note", None),
                                  expected_run_id=_worker_run_id_for(args.task_id))
     return _ok_or_err(ok, f"cannot heartbeat {args.task_id} (not running?)",
@@ -716,6 +728,36 @@ def _cmd_unlink(args: argparse.Namespace) -> int:
 
 
 def _cmd_claim(args: argparse.Namespace) -> int:
+    """Atomically claim a ready task for this process.
+
+    Unlike the dispatcher's fire-and-forget spawn (which records ``worker_pid``
+    via ``_set_worker_pid`` right after ``Popen`` returns), this CLI path IS the
+    worker: there is no separate child process to track. Before this fix,
+    ``claim_task`` set ``claim_lock`` to the default ``_claimer_id()``
+    (``host:os.getpid()``) but nothing ever recorded that same pid onto
+    ``tasks.worker_pid`` / ``task_runs.worker_pid`` -- so a task claimed this
+    way (e.g. a long-running build script driving the board directly with
+    `hermes kanban claim` + periodic `hermes kanban heartbeat`) always carried
+    ``worker_pid=None``. Two safety nets in ``kanban_db`` depend on that column
+    being populated for a live worker to be recognised as such:
+    ``release_stale_claims``'s host-local live-PID claim extension (it can
+    only extend a TTL-expired claim for a worker it can prove is alive via
+    ``worker_pid`` + ``worker_started_at``), and ``detect_crashed_workers`` /
+    ``reconcile_orphaned_running``'s dead-worker detection. With
+    ``worker_pid=None`` neither safety net can act: the claim just silently
+    expires and the task is yanked mid-flight even while the CLI-driven build
+    is still running and heartbeating fine on ITS OWN process id (t_05c82a67,
+    fix direction (b) -- the ``worker_pid=None`` / ``host_local=False``
+    dispatch-recording gap that survives the CLI-path heartbeat_claim fix).
+
+    Recording ``os.getpid()`` here (the SAME pid ``_claimer_id()`` already
+    baked into ``claim_lock`` by default) closes that gap for this dispatch
+    path: it costs nothing when a caller passes an explicit non-default
+    ``claimer`` (a remote/foreign lock), since the pid recorded is always this
+    process's own and the host-local check in ``release_stale_claims`` already
+    gates on ``claim_lock`` matching this host's prefix before ever consulting
+    ``worker_pid``.
+    """
     with kbc.connect_closing() as conn:
         task = kb.claim_task(conn, args.task_id, ttl_seconds=args.ttl)
         if task is None:
@@ -724,6 +766,7 @@ def _cmd_claim(args: argparse.Namespace) -> int:
                 return _err(f"no such task: {args.task_id}")
             return _err(f"cannot claim {args.task_id}: status={existing.status} "
                         f"lock={existing.claim_lock or '(none)'}")
+        kbd._set_worker_pid(conn, task.id, os.getpid())
         workspace = kbw.resolve_workspace(task)
         kbw.set_workspace_path(conn, task.id, str(workspace))
     print(f"Claimed {task.id}\nWorkspace: {workspace}")
