@@ -12,6 +12,7 @@ dispatcher.
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import time
 from pathlib import Path
@@ -144,7 +145,9 @@ def test_stale_claim_reclaim_fires_hook(kanban_home, captured_hooks):
     kw = fired[0][1]
     assert kw["task_id"] == tid
     assert kw["assignee"] == "worker"
-    assert kw["worker_pid"] is None
+    # The claim records the claiming process's pid so the stale-claim sweeper's
+    # live-worker guard has something to check; it is no longer NULL here.
+    assert kw["worker_pid"] == os.getpid()
     assert kw["heartbeat_stale"] is False
     assert kw["retry_status"] == "ready"
     assert kw["run_id"] is not None
