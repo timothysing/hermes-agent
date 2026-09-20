@@ -1093,6 +1093,21 @@ def _host_prefix() -> str:
     return f"{_claimer_id().split(':', 1)[0]}:"
 
 
+def _worker_fingerprint(pid: int) -> str:
+    """Restart-stable identity of ``pid`` for the liveness guards, never NULL.
+
+    Delegates to ``kanban_db_dispatch._process_fingerprint`` (imported late: the
+    dispatch module imports this one). A failed capture becomes
+    ``UNVERIFIED_WORKER_FINGERPRINT`` rather than NULL, so the row is held but never
+    signalled by bare PID number — NULL means "legacy pre-fingerprint row" and would
+    hand a fresh claim kill authority it has not earned.
+    """
+    from hermes_cli.kanban_db_dispatch import (
+        UNVERIFIED_WORKER_FINGERPRINT, _process_fingerprint)
+
+    return _process_fingerprint(int(pid)) or UNVERIFIED_WORKER_FINGERPRINT
+
+
 # --- Task creation / mutation ---
 
 def _validate_model_override(model: Optional[str], provider: Optional[str]) -> tuple[Optional[str], Optional[str]]:
@@ -2159,22 +2174,36 @@ def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
 
 def _claim_and_open_run(
     conn: sqlite3.Connection, task_id: str, source_status: str, lock: str, expires: int, now: int,
-    *, event_extra: Optional[dict] = None,
+    *, event_extra: Optional[dict] = None, worker_pid: Optional[int] = None,
 ) -> Optional[int]:
     """CAS ``source_status -> running``, open a run row, emit ``claimed``; None
-    when the CAS lost. Caller holds the txn."""
+    when the CAS lost. Caller holds the txn.
+
+    The claim also records the worker identity (``worker_pid`` +
+    ``worker_started_at``) that ``release_stale_claims``'s live-worker guard reads.
+    Without it, a claim opened outside the dispatcher's spawn path (the pull lane:
+    ``hermes kanban claim`` / :func:`claim_task`) carried a NULL pid for its whole
+    life, the guard could never be true, and a perfectly healthy worker was
+    reclaimed out from under itself on TTL expiry. ``worker_pid`` defaults to the
+    claiming process; the dispatcher overwrites it with the spawned child through
+    ``_set_worker_pid`` a moment later, so the row is never pid-less in between.
+    """
+    pid = int(worker_pid) if worker_pid else os.getpid()
+    started_at = _worker_fingerprint(pid)
     cur = conn.execute(
         f"""
         UPDATE tasks
-           SET status        = 'running',
-               claim_lock    = ?,
-               claim_expires = ?,
-               started_at    = COALESCE(started_at, ?)
+           SET status            = 'running',
+               claim_lock        = ?,
+               claim_expires     = ?,
+               worker_pid        = ?,
+               worker_started_at = ?,
+               started_at        = COALESCE(started_at, ?)
          WHERE id = ?
            AND status = '{source_status}'
            AND claim_lock IS NULL
         """,
-        (lock, expires, now, task_id),
+        (lock, expires, pid, started_at, now, task_id),
     )
     if cur.rowcount != 1:
         return None
@@ -2187,12 +2216,14 @@ def _claim_and_open_run(
         INSERT INTO task_runs (
             task_id, profile, step_key, status,
             claim_lock, claim_expires, max_runtime_seconds,
+            worker_pid, worker_started_at,
             started_at
-        ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?, ?)
         """,
         (
             task_id, trow["assignee"] if trow else None, trow["current_step_key"] if trow else None,
-            lock, expires, trow["max_runtime_seconds"] if trow else None, now,
+            lock, expires, trow["max_runtime_seconds"] if trow else None,
+            pid, started_at, now,
         ),
     )
     run_id = run_cur.lastrowid
@@ -2206,12 +2237,14 @@ def _claim_and_open_run(
 
 def claim_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
-    claimer: Optional[str] = None,
+    claimer: Optional[str] = None, worker_pid: Optional[int] = None,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
     Returns the claimed ``Task`` on success, ``None`` if the task was
-    already claimed (or is not in ``ready`` status).
+    already claimed (or is not in ``ready`` status). ``worker_pid`` names the
+    process that will actually do the work when it is not the caller (a pull-lane
+    claim made on behalf of a longer-lived agent); it defaults to this process.
     """
     now = int(time.time())
     lock = claimer or _claimer_id()
@@ -2231,7 +2264,8 @@ def claim_task(
         _reclaim_dangling_run(
             conn, task_id, statuses=("ready",), now=now, note="invariant recovery on re-claim",
         )
-        run_id = _claim_and_open_run(conn, task_id, "ready", lock, expires, now)
+        run_id = _claim_and_open_run(
+            conn, task_id, "ready", lock, expires, now, worker_pid=worker_pid)
         if run_id is None:
             return None
         claimed = get_task(conn, task_id)
@@ -2241,7 +2275,7 @@ def claim_task(
 
 def claim_review_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
-    claimer: Optional[str] = None,
+    claimer: Optional[str] = None, worker_pid: Optional[int] = None,
 ) -> Optional[Task]:
     """Atomic ``review -> running`` (None when lost). Parents are re-checked
     (one may have reopened meanwhile) and a NEW run tracks the reviewer
@@ -2262,7 +2296,8 @@ def claim_review_task(
                 )
             return None
         run_id = _claim_and_open_run(
-            conn, task_id, "review", lock, expires, now, event_extra={"source_status": "review"},
+            conn, task_id, "review", lock, expires, now,
+            event_extra={"source_status": "review"}, worker_pid=worker_pid,
         )
         if run_id is None:
             return None
@@ -2437,10 +2472,38 @@ def release_stale_claims(
         # observable progress — reclaim even if the PID is alive (logic loop).
         heartbeat_stale = hb is not None and (now - int(hb)) > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
         started_at = _row_get(row, "worker_started_at")
-        if (host_local and row["worker_pid"] and _worker_alive(row["worker_pid"], started_at)
-                and not heartbeat_stale):
+        # Does this claim name a SEPARATE worker process, or just its claimer? Every
+        # claim now stamps the claiming process's pid so the sweeper can see a live
+        # worker, so the pid alone no longer answers that. The spawn record does: a
+        # claim that never spawned a worker (a library/CLI caller claiming in-process)
+        # must still be reclaimed, otherwise the claimer's own liveness would extend it
+        # forever and the failure breaker could never trip.
+        spawned = _latest_event(conn, row["id"], "spawned", _current_run_id(conn, row["id"]))
+        worker_alive = (
+            bool(row["worker_pid"]) and spawned is not None
+            and _worker_alive(row["worker_pid"], started_at)
+        )
+        if host_local and row["worker_pid"] and worker_alive and not heartbeat_stale:
             _extend_live_stale_claim(conn, row, now)
             continue
+        # Which component of the live-worker guard vetoed the extension. Without this
+        # a reclaim of a healthy worker is indistinguishable from a reclaim of a dead
+        # one in the event log, and the NULL-pid bug hid behind both for weeks.
+        guard_failed = [
+            name for name, ok in (
+                ("host_local", host_local),
+                ("worker_pid", bool(row["worker_pid"])),
+                ("worker_spawned", spawned is not None),
+                ("worker_alive", worker_alive),
+                ("heartbeat_fresh", not heartbeat_stale),
+            ) if not ok
+        ]
+        _log.info(
+            "kanban reclaim %s: live-worker guard failed on %s "
+            "(claim_lock=%s host_prefix=%s worker_pid=%s)",
+            row["id"], ",".join(guard_failed), row["claim_lock"], host_prefix,
+            _opt_int(row["worker_pid"]),
+        )
 
         termination = _terminate_reclaimed_worker(
             row["worker_pid"], row["claim_lock"], signal_fn=signal_fn, started_at=started_at,
@@ -2475,6 +2538,7 @@ def release_stale_claims(
                     "host_local": host_local,
                     "heartbeat_stale": bool(heartbeat_stale),
                     "retry_status": retry_status,
+                    "guard_failed": guard_failed,
                 },
             )
             reclaimed += 1
@@ -2501,12 +2565,19 @@ def _record_reclaim(
     conn: sqlite3.Connection, task_id: str, termination: dict, *, error: str, payload: dict,
 ) -> Optional[int]:
     """Close the active run as ``reclaimed`` and emit the ``reclaimed`` event
-    (payload merged with the termination report). Caller holds the txn."""
+    (payload merged with the termination report). Caller holds the txn.
+
+    The caller's keys win the merge. ``termination`` carries its own ``host_local``
+    meaning "was this lock ours to signal", which is False whenever there was no pid
+    to signal at all — letting it overwrite the caller's answer made every reclaim
+    event claim the lock was foreign, even when it was minted on this very host, and
+    hid the real cause (a NULL ``worker_pid``) behind a wrong one.
+    """
     run_id = _end_run(
         conn, task_id, outcome="reclaimed", status="reclaimed", error=error, metadata=termination,
     )
-    payload.update(termination)
-    _append_event(conn, task_id, "reclaimed", payload, run_id=run_id)
+    merged = {**termination, **payload}
+    _append_event(conn, task_id, "reclaimed", merged, run_id=run_id)
     return run_id
 
 
@@ -2679,18 +2750,25 @@ class LiveClaimError(ValueError):
         )
 
 
-def _claim_is_live(trow) -> bool:
-    """True when a ``running`` task's claim still protects a run: the worker process
-    it spawned exists (PID + start-time fingerprint). A claim whose worker is gone,
-    or a library/CLI claim that never spawned one, has no run to protect. TTL expiry
-    is deliberately not consulted: ``reclaim_stale_tasks`` extends, not reclaims, the
-    claim of a live worker, so the process is the liveness authority here too."""
-    return bool(
-        trow["status"] == "running"
-        and trow["claim_lock"] is not None
-        and trow["worker_pid"]
-        and _worker_alive(trow["worker_pid"], trow["worker_started_at"])
-    )
+def _claim_is_live(conn: sqlite3.Connection, task_id: str, trow) -> bool:
+    """True when a ``running`` task's claim protects a SPAWNED worker's run: the
+    dispatcher started a separate process for this run and that process still exists
+    (PID + start-time fingerprint).
+
+    The spawn record — not the mere presence of ``worker_pid`` — is the authority.
+    Every claim now stamps the claiming process's pid so the stale-claim sweeper can
+    see a live worker (that is the whole point of the pid being on the row), which
+    means a pid alone no longer distinguishes "a worker is executing this card" from
+    "a library/CLI caller claimed it in-process". A claim that never spawned a worker
+    has no foreign run to protect, exactly as before. TTL expiry is deliberately not
+    consulted: ``release_stale_claims`` extends, not reclaims, the claim of a live
+    worker, so the process is the liveness authority here too.
+    """
+    if not (trow["status"] == "running" and trow["claim_lock"] is not None and trow["worker_pid"]):
+        return False
+    if _latest_event(conn, task_id, "spawned", _current_run_id(conn, task_id)) is None:
+        return False
+    return bool(_worker_alive(trow["worker_pid"], trow["worker_started_at"]))
 
 
 def complete_task(
@@ -2740,7 +2818,7 @@ def complete_task(
         # Refuse to close a LIVE worker's run without proof of ownership
         # (expected_run_id) or an explicit human override (force=True); see
         # _claim_is_live for what "live" means.
-        if expected_run_id is None and not force and trow and _claim_is_live(trow):
+        if expected_run_id is None and not force and trow and _claim_is_live(conn, task_id, trow):
             raise LiveClaimError(task_id)
         sql = """
                 UPDATE tasks
@@ -3242,7 +3320,7 @@ def request_review(
             # Refuse to clear a live worker's claim without proof of ownership
             # (expected_run_id) or an explicit human override (force=True);
             # the same fence as complete_task (_claim_is_live).
-            if expected_run_id is None and not force and _claim_is_live(trow):
+            if expected_run_id is None and not force and _claim_is_live(conn, task_id, trow):
                 return _ret(
                     False, "task is running under a live claim; pass expected_run_id "
                     "(worker ownership) or force=True (explicit operator "
