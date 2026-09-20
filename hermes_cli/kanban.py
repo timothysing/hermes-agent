@@ -717,7 +717,8 @@ def _cmd_unlink(args: argparse.Namespace) -> int:
 
 def _cmd_claim(args: argparse.Namespace) -> int:
     with kbc.connect_closing() as conn:
-        task = kb.claim_task(conn, args.task_id, ttl_seconds=args.ttl)
+        task = kb.claim_task(conn, args.task_id, ttl_seconds=args.ttl,
+                             worker_pid=getattr(args, "worker_pid", None))
         if task is None:
             existing = kb.get_task(conn, args.task_id)
             if existing is None:

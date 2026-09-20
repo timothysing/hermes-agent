@@ -260,6 +260,11 @@ _SPECS = [
     _cmd("claim", [
         _TASK_ID,
         _arg("--ttl", type=int, default=kb.DEFAULT_CLAIM_TTL_SECONDS, help="Claim TTL in seconds (default: 900)"),
+        _arg("--worker-pid", type=int,
+             help="PID of the process that will do the work (default: this one). Pull-lane "
+                  "callers claim from a short-lived CLI on behalf of a long-lived agent; "
+                  "naming it lets the stale-claim sweeper see a live worker and extend the "
+                  "claim instead of reclaiming it."),
     ], help="Atomically claim a ready task (prints resolved workspace path)"),
     _cmd("comment", [
         _TASK_ID,
