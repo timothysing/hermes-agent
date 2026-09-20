@@ -399,6 +399,15 @@ def _terminate_reclaimed_worker(
     }
     if not pid or pid <= 0 or not claim_lock:
         return info
+    if int(pid) == os.getpid():
+        # Never signal ourselves. Every claim now stamps the claiming process's pid so
+        # the stale-claim sweeper can see a live worker; a caller that claims in-process
+        # and later sweeps its own row would otherwise SIGTERM the running process. The
+        # row names no separate worker, so there is nothing to terminate and the reclaim
+        # proceeds (``_reap_terminal_worker_row`` applies the same rule).
+        info["self_pid"] = True
+        info["terminated"] = True
+        return info
     if not str(claim_lock).startswith(_kb._host_prefix()):
         return info
     info["host_local"] = True
@@ -556,6 +565,14 @@ def heartbeat_worker(
     Liveness signal orthogonal to the PID check: a worker whose forked child
     (train loop, crawl) is stuck can still have a live Python process.
     Returns False if the task is not running or its claim expired.
+
+    A beat from a worker whose row has NO usable worker identity also adopts it
+    (pid + fingerprint). That is the convergence path for rows claimed before this
+    field existed, or by a process that has since exited: the next beat from the
+    real worker makes ``release_stale_claims``'s live-worker guard able to see it.
+    A row that already names a LIVE process is never repointed — an ephemeral CLI
+    beat must not steal a running worker's identity and hand its kill authority to
+    a pid that is about to exit.
     """
     now = int(time.time())
     with _kb.write_txn(conn):
@@ -574,12 +591,38 @@ def heartbeat_worker(
         )
         if run_id is not None:
             conn.execute("UPDATE task_runs SET last_heartbeat_at = ? WHERE id = ?", (now, run_id))
+        _adopt_worker_identity(conn, task_id, run_id)
         _kb._append_event(
             conn, task_id, "heartbeat",
             {"note": note} if note else None,
             run_id=run_id,
         )
     return True
+
+
+def _adopt_worker_identity(
+    conn: sqlite3.Connection, task_id: str, run_id: Optional[int],
+) -> None:
+    """Point a worker-identity-less running row at THIS process. Caller holds the txn."""
+    row = conn.execute(
+        "SELECT worker_pid, worker_started_at FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None:
+        return
+    pid = _kb._opt_int(row["worker_pid"])
+    if pid and _worker_alive(pid, _kb._row_get(row, "worker_started_at")):
+        return
+    mine = os.getpid()
+    started_at = _kb._worker_fingerprint(mine)
+    conn.execute(
+        "UPDATE tasks SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
+        (mine, started_at, task_id),
+    )
+    if run_id is not None:
+        conn.execute(
+            "UPDATE task_runs SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
+            (mine, started_at, run_id),
+        )
 
 
 def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str]:
@@ -618,6 +661,12 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
         pid = int(row["worker_pid"])
         tid = row["id"]
         started_at = _kb._row_get(row, "worker_started_at")
+        if _kb._latest_event(conn, tid, "spawned", _kb._current_run_id(conn, tid)) is None:
+            # No worker was ever spawned for this run: ``worker_pid`` names the process
+            # that CLAIMED the card (every claim stamps its own pid so the stale-claim
+            # sweeper can see a live worker), which may well be this one. There is no
+            # worker to time out, and signalling that pid would kill the claimer.
+            continue
         if started_at == UNVERIFIED_WORKER_FINGERPRINT and _kb._pid_alive(pid):
             # Fingerprint capture failed at spawn: we cannot prove this live PID is our worker, so
             # it is neither signalled nor released beside (duplicate). It is reclaimed once it exits.
