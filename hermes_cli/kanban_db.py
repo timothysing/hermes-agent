@@ -2472,15 +2472,18 @@ def release_stale_claims(
         # observable progress — reclaim even if the PID is alive (logic loop).
         heartbeat_stale = hb is not None and (now - int(hb)) > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
         started_at = _row_get(row, "worker_started_at")
-        # Does this claim name a SEPARATE worker process, or just its claimer? Every
-        # claim now stamps the claiming process's pid so the sweeper can see a live
-        # worker, so the pid alone no longer answers that. The spawn record does: a
-        # claim that never spawned a worker (a library/CLI caller claiming in-process)
-        # must still be reclaimed, otherwise the claimer's own liveness would extend it
-        # forever and the failure breaker could never trip.
-        spawned = _latest_event(conn, row["id"], "spawned", _current_run_id(conn, row["id"]))
+        # Does this claim name a SEPARATE worker process, or just its own claimer?
+        # Every claim now stamps the claiming process's pid so the sweeper can see a
+        # live worker, so a pid alone no longer answers that. A row with no spawn
+        # record that names THIS process names no worker at all (a library/CLI caller
+        # claimed in-process): it must still be reclaimed, otherwise the claimer's own
+        # liveness would extend the claim forever and the breaker could never trip.
+        claimer_only = (
+            bool(row["worker_pid"]) and int(row["worker_pid"]) == os.getpid()
+            and _latest_event(conn, row["id"], "spawned", _current_run_id(conn, row["id"])) is None
+        )
         worker_alive = (
-            bool(row["worker_pid"]) and spawned is not None
+            bool(row["worker_pid"]) and not claimer_only
             and _worker_alive(row["worker_pid"], started_at)
         )
         if host_local and row["worker_pid"] and worker_alive and not heartbeat_stale:
@@ -2493,7 +2496,7 @@ def release_stale_claims(
             name for name, ok in (
                 ("host_local", host_local),
                 ("worker_pid", bool(row["worker_pid"])),
-                ("worker_spawned", spawned is not None),
+                ("separate_worker_process", not claimer_only),
                 ("worker_alive", worker_alive),
                 ("heartbeat_fresh", not heartbeat_stale),
             ) if not ok
@@ -2751,22 +2754,22 @@ class LiveClaimError(ValueError):
 
 
 def _claim_is_live(conn: sqlite3.Connection, task_id: str, trow) -> bool:
-    """True when a ``running`` task's claim protects a SPAWNED worker's run: the
-    dispatcher started a separate process for this run and that process still exists
-    (PID + start-time fingerprint).
+    """True when a ``running`` task's claim protects a SEPARATE worker's run: a process
+    other than this one owns the card and still exists (PID + start-time fingerprint).
 
-    The spawn record — not the mere presence of ``worker_pid`` — is the authority.
-    Every claim now stamps the claiming process's pid so the stale-claim sweeper can
-    see a live worker (that is the whole point of the pid being on the row), which
-    means a pid alone no longer distinguishes "a worker is executing this card" from
-    "a library/CLI caller claimed it in-process". A claim that never spawned a worker
-    has no foreign run to protect, exactly as before. TTL expiry is deliberately not
-    consulted: ``release_stale_claims`` extends, not reclaims, the claim of a live
-    worker, so the process is the liveness authority here too.
+    Every claim now stamps the claiming process's pid so the stale-claim sweeper can see
+    a live worker, so a pid alone no longer distinguishes "a worker is executing this
+    card" from "a library/CLI caller claimed it in-process". A row that names THIS
+    process with no spawn record is the latter: the caller closing it is the owner, not
+    an interloper, and there is no foreign run to protect — exactly the pre-existing
+    behaviour for a claim that never spawned. TTL expiry is deliberately not consulted:
+    ``release_stale_claims`` extends, not reclaims, the claim of a live worker, so the
+    process is the liveness authority here too.
     """
     if not (trow["status"] == "running" and trow["claim_lock"] is not None and trow["worker_pid"]):
         return False
-    if _latest_event(conn, task_id, "spawned", _current_run_id(conn, task_id)) is None:
+    if int(trow["worker_pid"]) == os.getpid() and _latest_event(
+            conn, task_id, "spawned", _current_run_id(conn, task_id)) is None:
         return False
     return bool(_worker_alive(trow["worker_pid"], trow["worker_started_at"]))
 

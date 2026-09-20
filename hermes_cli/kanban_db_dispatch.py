@@ -661,11 +661,12 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
         pid = int(row["worker_pid"])
         tid = row["id"]
         started_at = _kb._row_get(row, "worker_started_at")
-        if _kb._latest_event(conn, tid, "spawned", _kb._current_run_id(conn, tid)) is None:
-            # No worker was ever spawned for this run: ``worker_pid`` names the process
-            # that CLAIMED the card (every claim stamps its own pid so the stale-claim
-            # sweeper can see a live worker), which may well be this one. There is no
-            # worker to time out, and signalling that pid would kill the claimer.
+        if pid == os.getpid() and _kb._latest_event(
+                conn, tid, "spawned", _kb._current_run_id(conn, tid)) is None:
+            # No worker was ever spawned and ``worker_pid`` is OUR pid: the row names
+            # the process that CLAIMED the card (every claim stamps its own pid so the
+            # stale-claim sweeper can see a live worker), not a worker. There is nothing
+            # to time out here, and signalling that pid would kill the enforcer.
             continue
         if started_at == UNVERIFIED_WORKER_FINGERPRINT and _kb._pid_alive(pid):
             # Fingerprint capture failed at spawn: we cannot prove this live PID is our worker, so
