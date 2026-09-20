@@ -182,3 +182,26 @@ def test_run_slash_reclaim_running_task(kanban_home):
 # ---------------------------------------------------------------------------
 
 
+
+
+def test_cli_heartbeat_extends_the_claim_lease(kanban_home, monkeypatch):
+    """``hermes kanban heartbeat`` must move ``claim_expires`` forward, not only
+    stamp ``last_heartbeat_at``. Stamping alone is how a worker shows 20 healthy
+    heartbeats on the board and is then reclaimed at TTL."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="cli hb", assignee="a")
+        host = kb._claimer_id().split(":", 1)[0]
+        dispatcher_lock = f"{host}:{os.getpid() + 1}"
+        kb.claim_task(conn, tid, claimer=dispatcher_lock, ttl_seconds=60)
+        before = conn.execute(
+            "SELECT claim_expires FROM tasks WHERE id = ?", (tid,)).fetchone()["claim_expires"]
+
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", dispatcher_lock)
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_TTL_SECONDS", "3600")
+    kc.run_slash(f"heartbeat {tid}")
+
+    with kbc.connect() as conn:
+        after = conn.execute(
+            "SELECT claim_expires, last_heartbeat_at FROM tasks WHERE id = ?", (tid,)).fetchone()
+    assert after["claim_expires"] > before
+    assert after["last_heartbeat_at"] is not None

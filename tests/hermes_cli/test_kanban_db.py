@@ -1913,3 +1913,84 @@ def test_archive_non_running_task_does_not_attempt_termination(kanban_home):
             (t,),
         ).fetchone()
         assert row is None
+
+
+def test_heartbeat_claim_extends_lease_from_env_lock_when_pid_differs(kanban_home, monkeypatch):
+    """A dispatcher-spawned worker extends the lease it was given.
+
+    The claim is taken by the dispatcher process and heartbeated by the worker
+    process, so a lock recomputed from ``os.getpid()`` can never match. The
+    worker presents ``HERMES_KANBAN_CLAIM_LOCK`` (pinned at spawn) instead, and
+    ``claim_expires`` on both the task and its run row moves forward.
+    """
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        host = kb._claimer_id().split(":", 1)[0]
+        dispatcher_lock = f"{host}:{os.getpid() + 1}"
+        kb.claim_task(conn, t, claimer=dispatcher_lock, ttl_seconds=60)
+        before = conn.execute(
+            "SELECT claim_expires FROM tasks WHERE id = ?", (t,)).fetchone()["claim_expires"]
+
+        monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", dispatcher_lock)
+        assert kb.heartbeat_claim(conn, t, ttl_seconds=3600) is True
+
+        after = conn.execute(
+            "SELECT claim_expires FROM tasks WHERE id = ?", (t,)).fetchone()["claim_expires"]
+        assert after > before
+        run = conn.execute(
+            "SELECT claim_expires FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (t,)).fetchone()
+        assert run["claim_expires"] == after
+
+
+def test_heartbeat_claim_falls_back_to_stored_host_local_lock(kanban_home, monkeypatch):
+    """With no lock supplied, authorise on the task's OWN stored lock when that
+    lock was issued by this host — never on a freshly computed host:pid."""
+    monkeypatch.delenv("HERMES_KANBAN_CLAIM_LOCK", raising=False)
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        host = kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, t, claimer=f"{host}:{os.getpid() + 1}", ttl_seconds=60)
+        before = conn.execute(
+            "SELECT claim_expires FROM tasks WHERE id = ?", (t,)).fetchone()["claim_expires"]
+
+        assert kb.heartbeat_claim(conn, t, ttl_seconds=3600) is True
+        after = conn.execute(
+            "SELECT claim_expires FROM tasks WHERE id = ?", (t,)).fetchone()["claim_expires"]
+        assert after > before
+
+
+def test_heartbeat_claim_refuses_foreign_host_lock(kanban_home, monkeypatch):
+    """Authorisation is not weakened: a claim held by ANOTHER host is never
+    extended by a local heartbeat, with or without a presented lock."""
+    monkeypatch.delenv("HERMES_KANBAN_CLAIM_LOCK", raising=False)
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        foreign = "some-other-host:4242"
+        kb.claim_task(conn, t, claimer=foreign, ttl_seconds=60)
+        before = conn.execute(
+            "SELECT claim_expires FROM tasks WHERE id = ?", (t,)).fetchone()["claim_expires"]
+
+        assert kb.heartbeat_claim(conn, t, ttl_seconds=3600) is False
+        assert kb.heartbeat_claim(conn, t, ttl_seconds=3600, claimer=kb._claimer_id()) is False
+        after = conn.execute(
+            "SELECT claim_expires FROM tasks WHERE id = ?", (t,)).fetchone()["claim_expires"]
+        assert after == before
+
+
+def test_heartbeat_claim_mismatch_logs_warning_naming_both_locks(kanban_home, monkeypatch, caplog):
+    """A refused extension must be loud: the silent False is how a worker
+    heartbeats its way into a reclaim while the board still looks healthy."""
+    monkeypatch.delenv("HERMES_KANBAN_CLAIM_LOCK", raising=False)
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        host = kb._claimer_id().split(":", 1)[0]
+        stored = f"{host}:{os.getpid() + 1}"
+        kb.claim_task(conn, t, claimer=stored, ttl_seconds=60)
+
+        with caplog.at_level("WARNING", logger="hermes_cli.kanban_db"):
+            assert kb.heartbeat_claim(conn, t, claimer="wrong-host:1") is False
+        message = "\n".join(r.getMessage() for r in caplog.records)
+        assert t in message
+        assert "wrong-host:1" in message
+        assert stored in message

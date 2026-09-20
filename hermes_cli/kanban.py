@@ -317,6 +317,13 @@ def _cmd_init(args: argparse.Namespace) -> int:
 
 def _cmd_heartbeat(args: argparse.Namespace) -> int:
     with kbc.connect_closing() as conn:
+        # Extend the claim lease as well as stamping last_heartbeat_at: without
+        # this half, a worker driving the board through the CLI looks healthy on
+        # the board while release_stale_claims reclaims it at TTL. The lock comes
+        # from HERMES_KANBAN_CLAIM_LOCK (pinned at spawn); heartbeat_claim falls
+        # back to the task's stored host-local lock when it is absent.
+        kb.heartbeat_claim(conn, args.task_id,
+                           claimer=os.environ.get("HERMES_KANBAN_CLAIM_LOCK"))
         ok = kbd.heartbeat_worker(conn, args.task_id, note=getattr(args, "note", None),
                                  expected_run_id=_worker_run_id_for(args.task_id))
     return _ok_or_err(ok, f"cannot heartbeat {args.task_id} (not running?)",

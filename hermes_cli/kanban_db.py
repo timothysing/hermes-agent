@@ -2324,19 +2324,60 @@ def goal_run_status(
     return task.status
 
 
+def _resolve_heartbeat_lock(
+    conn: sqlite3.Connection, task_id: str, claimer: Optional[str],
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """Lock a heartbeat should present, plus the stored lock/status for diagnostics.
+
+    The claim is taken by the *dispatcher* process but heartbeated by the
+    *worker* process, so recomputing ``_claimer_id()`` (``host:pid``) here can
+    never match and the lease was silently never extended — the board showed
+    healthy heartbeats right up to the reclaim. Resolution order:
+
+    1. explicit ``claimer`` passed by the caller,
+    2. ``HERMES_KANBAN_CLAIM_LOCK``, pinned into the worker's env at spawn,
+    3. the task row's stored ``claim_lock`` — but only when that lock was
+       issued by THIS host, so a foreign host still cannot extend someone
+       else's claim,
+    4. ``_claimer_id()``, for a process that really did claim in-process.
+    """
+    row = conn.execute(
+        "SELECT claim_lock, status FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    stored = (_row_get(row, "claim_lock") or None) if row is not None else None
+    status = (_row_get(row, "status") or None) if row is not None else None
+    lock = claimer or os.environ.get("HERMES_KANBAN_CLAIM_LOCK") or None
+    if not lock:
+        lock = stored if (stored or "").startswith(_host_prefix()) else _claimer_id()
+    return lock, stored, status
+
+
 def heartbeat_claim(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
 ) -> bool:
-    """Extend a running claim; True if we still own it."""
+    """Extend a running claim; True if we still own it.
+
+    ``claimer`` is the lock the caller actually holds (for dispatcher-spawned
+    workers, ``HERMES_KANBAN_CLAIM_LOCK``). See :func:`_resolve_heartbeat_lock`
+    — the PID-derived id is the last resort, not the default, because the
+    heartbeating process is not the claiming process.
+    """
     expires = int(time.time()) + _resolve_claim_ttl_seconds(ttl_seconds)
-    lock = claimer or _claimer_id()
+    lock, stored, status = _resolve_heartbeat_lock(conn, task_id, claimer)
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET claim_expires = ? "
             "WHERE id = ? AND status = 'running' AND claim_lock = ?", (expires, task_id, lock),
         )
         if cur.rowcount != 1:
+            # Loud on purpose: a silent False here is exactly how a worker
+            # heartbeats its way into a reclaim while the board looks healthy.
+            _log.warning(
+                "kanban heartbeat_claim did not extend task %s: presented lock %r, stored lock %r, "
+                "task status %r (claim lease NOT extended; this worker will be reclaimed when the "
+                "lease expires)", task_id, lock, stored, status,
+            )
             return False
         _extend_run_claim(conn, task_id, expires)
         return True
